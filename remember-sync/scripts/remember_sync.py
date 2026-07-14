@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-리멤버(rememberapp.co.kr) 개인명함첩 xlsx  ->  Notion 연락처 DB 동기화
+리멤버(rememberapp.co.kr) 개인명함첩 xlsx  ->  Notion People DB 동기화
 
 - xlsx는 표준 라이브러리만으로 파싱(zipfile + xml.etree, openpyxl 등 외부 의존성 없음)
 - "명함 등록일" 기준 체크포인트 이후(=신규)만 Notion에 새 페이지로 생성
-- 체크포인트 없으면(최초 실행) 연락처 DB 전체를 스캔해 현재 최신 등록일을 찾아 시드
+- 체크포인트 없으면(최초 실행) People DB 전체를 스캔해 현재 최신 명함등록일을 찾아 시드
+- People DB는 curated 관계 자산 DB이므로, 생성 전 전화번호로 기존 레코드와 중복 여부를 확인해 중복 생성을 피함
 - dry-run 기본. --apply 줘야 실제로 Notion에 씀.
+
+2026-07-14: 기존 동기화 대상이던 "연락처" DB가 삭제되어 People DB로 리다이렉트됨.
+People DB에는 연락처 DB에 있던 부서/회사폰/팩스/명함첩/그룹 필드가 없어 Notes 필드에 묶어서 보존함.
 
 사용법:
     python3 remember_sync.py <xlsx_path>            # 무엇이 새로 들어갈지 미리보기만
@@ -20,7 +24,7 @@ STATE_FILE = os.path.join(HERE, "remember_sync_state.json")
 
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
-CONTACTS_DB = "28c09bfe-5079-8090-b8f6-cac0dab4b960"  # 연락처 (data source: 28c09bfe-5079-81cd-b345-000b540ff532)
+PEOPLE_DB = "c4713375-ffd4-4bb1-b6aa-61e61e55d78c"  # 👥 People (data source: d723da41-7700-48f9-81cf-5a3fb4a71fd8)
 
 # xlsx 컬럼 순서 (헤더 그대로): 회사,이름,부서,직함,전자 메일 주소,근무지 주소 번지,근무처 전화,근무처 팩스,휴대폰,명함 등록일,명함첩 이름,그룹,메모
 COL = {"company": 0, "name": 1, "dept": 2, "title": 3, "email": 4, "addr": 5,
@@ -108,6 +112,10 @@ def parse_korean_date(s):
     return datetime.date(y, mo, d)
 
 
+def normalize_phone(s):
+    return re.sub(r"\D", "", s or "")
+
+
 # ---------- Notion API (stdlib only, notion-obsidian-sync/sync.py 패턴 재사용) ----------
 
 def notion_request(method, path, body=None, retries=5):
@@ -143,13 +151,13 @@ def notion_request(method, path, body=None, retries=5):
     raise SystemExit("Notion API 실패: %s" % last)
 
 
-def fetch_all_contacts():
+def fetch_all_people():
     rows, cursor = [], None
     while True:
         body = {"page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
-        d = notion_request("POST", "/databases/%s/query" % CONTACTS_DB, body)
+        d = notion_request("POST", "/databases/%s/query" % PEOPLE_DB, body)
         rows.extend(d["results"])
         if not d.get("has_more"):
             break
@@ -157,20 +165,29 @@ def fetch_all_contacts():
     return rows
 
 
-def rich_text_value(page, prop_name):
+def date_value(page, prop_name):
     p = page["properties"].get(prop_name)
     if not p:
-        return ""
-    arr = p.get("rich_text", [])
-    return "".join(x.get("plain_text", "") for x in arr)
+        return None
+    d = p.get("date")
+    if not d or not d.get("start"):
+        return None
+    return datetime.date.fromisoformat(d["start"][:10])
+
+
+def phone_value(page):
+    p = page["properties"].get("Phone")
+    if not p:
+        return None
+    return p.get("phone_number")
 
 
 def compute_current_max_registered_date():
-    """연락처 DB 전체를 스캔해 현재 등록일 최댓값을 찾음 (등록일이 rich_text라 Notion API 정렬 불가)."""
-    rows = fetch_all_contacts()
+    """People DB 전체를 스캔해 현재 명함등록일 최댓값을 찾음 (최초 1회, bootstrap용)."""
+    rows = fetch_all_people()
     max_date = None
     for page in rows:
-        d = parse_korean_date(rich_text_value(page, "등록일"))
+        d = date_value(page, "명함등록일")
         if d and (max_date is None or d > max_date):
             max_date = d
     return max_date, len(rows)
@@ -201,26 +218,40 @@ def build_notion_properties(row):
     def phone(text):
         return {"phone_number": text or None}
 
+    def reg_date_prop(text):
+        d = parse_korean_date(text)
+        return {"date": {"start": d.isoformat()} if d else None}
+
     groups_raw = (row[COL["groups"]] or "").strip()
     groups = [g.strip() for g in groups_raw.split(",") if g.strip()]
 
-    props = {
-        "이름": {"title": [{"text": {"content": row[COL["name"]] or "(이름 없음)"}}]},
-        "회사": rt(row[COL["company"]]),
-        "부서": rt(row[COL["dept"]]),
-        "직책": rt(row[COL["title"]]),
-        "회사폰": phone(row[COL["office_phone"]]),
-        "팩스": phone(row[COL["fax"]]),
-        "스마트폰": phone(row[COL["mobile"]]),
-        "등록일": rt(row[COL["reg_date"]]),
-        "관계 및 특성": rt(row[COL["memo"]]),
-    }
-    email = (row[COL["email"]] or "").strip()
-    if email:
-        props["이메일 주소"] = {"email": email}
+    # People DB에는 부서/회사폰/팩스/명함첩/그룹 전용 필드가 없어 Notes에 묶어서 보존
+    notes_parts = []
+    if row[COL["dept"]]:
+        notes_parts.append("부서: %s" % row[COL["dept"]])
+    if row[COL["office_phone"]]:
+        notes_parts.append("회사폰: %s" % row[COL["office_phone"]])
+    if row[COL["fax"]]:
+        notes_parts.append("팩스: %s" % row[COL["fax"]])
+    if row[COL["book"]]:
+        notes_parts.append("명함첩: %s" % row[COL["book"]])
     if groups:
-        props["그룹"] = {"multi_select": [{"name": g} for g in groups]}
-    return props
+        notes_parts.append("그룹: %s" % ", ".join(groups))
+    if row[COL["memo"]]:
+        notes_parts.append(row[COL["memo"]])
+    notes_text = " / ".join(notes_parts)
+
+    return {
+        "Name": {"title": [{"text": {"content": row[COL["name"]] or "(이름 없음)"}}]},
+        "회사명": rt(row[COL["company"]]),
+        "Role": rt(row[COL["title"]]),
+        "Phone": phone(row[COL["mobile"]]),
+        "Company email": rt(row[COL["email"]]),
+        "Location": rt(row[COL["addr"]]),
+        "명함등록일": reg_date_prop(row[COL["reg_date"]]),
+        "Notes": rt(notes_text),
+        "Category": {"multi_select": [{"name": "업무"}]},
+    }
 
 
 def main():
@@ -231,11 +262,11 @@ def main():
 
     checkpoint, state = load_checkpoint()
     if checkpoint is None:
-        print("체크포인트 없음 — 연락처 DB 전체 스캔해서 현재 최신 등록일 계산 중 (최초 1회, 시간 걸림)...")
+        print("체크포인트 없음 — People DB 전체 스캔해서 현재 최신 명함등록일 계산 중 (최초 1회, 시간 걸림)...")
         checkpoint, total = compute_current_max_registered_date()
         if checkpoint is None:
-            raise SystemExit("연락처 DB에서 등록일 파싱 가능한 레코드를 찾지 못함 — 수동 확인 필요")
-        print("  스캔 완료: 총 %d건, 현재 최신 등록일 = %s" % (total, checkpoint))
+            raise SystemExit("People DB에서 명함등록일 파싱 가능한 레코드를 찾지 못함 — 수동 확인 필요")
+        print("  스캔 완료: 총 %d건, 현재 최신 명함등록일 = %s" % (total, checkpoint))
         save_checkpoint(checkpoint, extra_note="bootstrap scan (%d records)" % total)
 
     print("체크포인트(마지막 동기화된 명함등록일): %s" % checkpoint)
@@ -266,20 +297,36 @@ def main():
         print("\n(dry-run) 실제로 생성하려면 --apply 옵션을 추가하세요.")
         return
 
+    print("중복 방지를 위해 People DB 기존 전화번호 스캔 중...")
+    existing_page_rows = fetch_all_people()
+    existing_phones = {normalize_phone(phone_value(p)) for p in existing_page_rows if phone_value(p)}
+    print("  기존 People 레코드 %d건 (전화번호 보유 %d건)" % (len(existing_page_rows), len(existing_phones)))
+
     created = 0
+    skipped = 0
     max_created_date = checkpoint
     for d, row in new_rows:
+        mobile_norm = normalize_phone(row[COL["mobile"]])
+        if mobile_norm and mobile_norm in existing_phones:
+            skipped += 1
+            print("  [skip] 기존 People에 동일 전화번호 존재: %s / %s" % (row[COL["name"]], row[COL["company"]]))
+            if d > max_created_date:
+                max_created_date = d
+            continue
+
         props = build_notion_properties(row)
-        body = {"parent": {"database_id": CONTACTS_DB}, "properties": props}
+        body = {"parent": {"database_id": PEOPLE_DB}, "properties": props}
         notion_request("POST", "/pages", body)
+        if mobile_norm:
+            existing_phones.add(mobile_norm)
         created += 1
         if d > max_created_date:
             max_created_date = d
         if created % 20 == 0:
             print("  %d/%d 생성됨..." % (created, len(new_rows)))
 
-    save_checkpoint(max_created_date, extra_note="synced from %s (%d new)" % (os.path.basename(xlsx_path), created))
-    print("완료: %d건 신규 생성. 체크포인트 갱신 -> %s" % (created, max_created_date))
+    save_checkpoint(max_created_date, extra_note="synced from %s (%d new, %d skipped as dup)" % (os.path.basename(xlsx_path), created, skipped))
+    print("완료: %d건 신규 생성, %d건 중복 스킵. 체크포인트 갱신 -> %s" % (created, skipped, max_created_date))
 
 
 if __name__ == "__main__":
